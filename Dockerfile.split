@@ -1,0 +1,99 @@
+# syntax=docker/dockerfile:1.7
+# BIMHub — SPLIT images: web / worker / migrate (one Dockerfile, three targets).
+#
+#   docker build -f Dockerfile.split --target web     -t bimhub-web:$VER     --build-arg VERSION=$VER .
+#   docker build -f Dockerfile.split --target worker  -t bimhub-worker:$VER  --build-arg VERSION=$VER .
+#   docker build -f Dockerfile.split --target migrate -t bimhub-migrate:$VER .
+#
+# Requires in frontend/next.config: output: 'standalone'
+# Mount a persistent volume at /data (PVC on OpenShift).
+# OpenShift/OKD: arbitrary UID in group 0 → files owned by 1001:0 with g=u.
+
+ARG NODE_IMAGE=public.ecr.aws/docker/library/node:22-bookworm-slim
+
+# ---------- base ----------
+FROM ${NODE_IMAGE} AS base
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends openssl tini
+
+# ---------- deps ----------
+FROM base AS deps
+WORKDIR /app
+COPY frontend/package.json frontend/package-lock.json ./
+RUN --mount=type=cache,target=/root/.npm npm ci --ignore-scripts
+
+# ---------- build ----------
+FROM deps AS build
+COPY frontend/ ./
+ARG NEXT_PUBLIC_SHOW_CLONINGLAB=true
+ARG NEXT_PUBLIC_LIBRARY_ALLOW_DOWNLOADS=false
+ARG NEXT_PUBLIC_API_URL=
+ENV NEXT_TELEMETRY_DISABLED=1 \
+    NEXT_PUBLIC_SHOW_CLONINGLAB=$NEXT_PUBLIC_SHOW_CLONINGLAB \
+    NEXT_PUBLIC_LIBRARY_ALLOW_DOWNLOADS=$NEXT_PUBLIC_LIBRARY_ALLOW_DOWNLOADS \
+    NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL
+# Next build + pre-bundled worker (no tsx at runtime → faster start, less RAM).
+RUN npx prisma generate \
+ && npm run build \
+ && npx esbuild scripts/ifc-worker.ts --bundle --platform=node --packages=external \
+      --tsconfig=tsconfig.worker.json --outfile=dist/ifc-worker.js \
+ && rm -rf .next/cache
+
+# ---------- prod-deps (worker only) ----------
+FROM build AS prod-deps
+RUN npm prune --omit=dev
+
+# ---------- migrate: Job / initContainer ----------
+FROM build AS migrate
+USER 1001
+CMD ["npx", "prisma", "migrate", "deploy"]
+
+# ---------- runtime base ----------
+FROM base AS runtime
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends qpdf \
+ && mkdir -p /data/library/data_lb /data/library/thumbnail_lb \
+             /data/familycenter/files /data/familycenter/previews_fc /data/familycenter/thumbnail_fc \
+             /data/thumbnail /data/cloning-storage /data/uploads \
+ && chgrp -R 0 /data && chmod -R g=u /data
+WORKDIR /usr/src/app
+ENV NODE_ENV=production \
+    PORT=8080 \
+    HOSTNAME=0.0.0.0 \
+    NEXT_TELEMETRY_DISABLED=1 \
+    AI_SEMANTIC=off \
+    LIBRARY_DATA_ROOT=/data/library/data_lb \
+    LIBRARY_THUMB_ROOT=/data/library/thumbnail_lb \
+    FAMILY_DATA_ROOT=/data/familycenter/files \
+    FAMILY_PREVIEW_ROOT=/data/familycenter/previews_fc \
+    FAMILY_THUMB_ROOT=/data/familycenter/thumbnail_fc \
+    FAMILY_LOCAL_STORAGE_ROOT=/data/thumbnail \
+    CLONING_STORAGE_ROOT=/data/cloning-storage
+ENTRYPOINT ["/usr/bin/tini", "--"]
+
+# ---------- web ----------
+FROM runtime AS web
+COPY --from=build --chown=1001:0 --chmod=g=u /app/.next/standalone ./
+COPY --from=build --chown=1001:0 --chmod=g=u /app/.next/static ./.next/static
+COPY --from=build --chown=1001:0 --chmod=g=u /app/public ./public
+RUN rm -rf public/uploads && ln -s /data/uploads public/uploads
+ARG VERSION=latest
+ENV IMAGE_VERSION=$VERSION
+LABEL org.opencontainers.image.revision=$VERSION
+USER 1001
+EXPOSE 8080
+CMD ["node", "server.js"]
+
+# ---------- worker ----------
+FROM runtime AS worker
+COPY --from=prod-deps --chown=1001:0 --chmod=g=u /app/node_modules ./node_modules
+COPY --from=build     --chown=1001:0 --chmod=g=u /app/dist ./dist
+COPY --from=build     --chown=1001:0 --chmod=g=u /app/package.json ./
+ARG VERSION=latest
+ENV IMAGE_VERSION=$VERSION \
+    NODE_OPTIONS=--max-old-space-size=4096
+LABEL org.opencontainers.image.revision=$VERSION
+USER 1001
+CMD ["node", "dist/ifc-worker.js"]
